@@ -198,6 +198,102 @@ class DataVersion(Base):
     change_type = Column(String(20))  # CREATE, UPDATE, DELETE
     change_reason = Column(Text)
 
+# ==========================================
+# PATIENT DATA TABLES (Moved from Oracle to SQLite)
+# ==========================================
+class HospitalSystem(Base):
+    __tablename__ = "hospital_systems"
+    
+    hospital_id = Column(Integer, primary_key=True, index=True)
+    hospital_name = Column(String(100), unique=True, nullable=False)
+    city = Column(String(50), nullable=False)
+    system_type = Column(String(50))  # Epic, Cerner, NextGen
+    api_endpoint = Column(String(200))
+    created_date = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    patient_records = relationship("PatientRecord", back_populates="hospital")
+
+class Patient(Base):
+    __tablename__ = "patients"
+    
+    patient_id = Column(Integer, primary_key=True, index=True)
+    first_name = Column(String(50), nullable=False)
+    last_name = Column(String(50), nullable=False)
+    date_of_birth = Column(String(20), nullable=False)
+    gender = Column(String(1))
+    ssn = Column(String(20), unique=True)
+    phone = Column(String(20))
+    email = Column(String(100))
+    emergency_contact = Column(String(100))
+    created_date = Column(DateTime, default=datetime.utcnow)
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    records = relationship("PatientRecord", back_populates="patient")
+
+class PatientRecord(Base):
+    __tablename__ = "patient_records"
+    
+    record_id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("patients.patient_id"), nullable=False)
+    hospital_id = Column(Integer, ForeignKey("hospital_systems.hospital_id"), nullable=False)
+    mrn = Column(String(30))
+    medical_history = Column(Text)
+    current_medications = Column(Text)  # JSON
+    allergies = Column(Text)  # JSON
+    chronic_conditions = Column(Text)  # JSON
+    last_visit_date = Column(String(20))
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    patient = relationship("Patient", back_populates="records")
+    hospital = relationship("HospitalSystem", back_populates="patient_records")
+
+class MatchingScore(Base):
+    __tablename__ = "matching_scores"
+    
+    match_id = Column(Integer, primary_key=True, index=True)
+    patient_id_1 = Column(Integer, nullable=False)
+    patient_id_2 = Column(Integer, nullable=False)
+    hospital_id_1 = Column(Integer, nullable=False)
+    hospital_id_2 = Column(Integer, nullable=False)
+    first_name_score = Column(String(10))
+    last_name_score = Column(String(10))
+    dob_score = Column(String(10))
+    ssn_score = Column(String(10))
+    overall_confidence_score = Column(String(10))
+    match_status = Column(String(20))
+    created_date = Column(DateTime, default=datetime.utcnow)
+    reviewed_by = Column(String(100))
+    reviewed_date = Column(DateTime)
+
+class CriticalAlert(Base):
+    __tablename__ = "critical_alerts"
+    
+    alert_id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("patients.patient_id"), nullable=False)
+    alert_type = Column(String(50))  # ALLERGY, DRUG_INTERACTION, CHRONIC_CONDITION, MEDICATION_WARNING
+    description = Column(String(500))
+    severity = Column(String(20))  # CRITICAL, HIGH, MEDIUM, LOW
+    alert_details = Column(Text)
+    created_date = Column(DateTime, default=datetime.utcnow)
+    acknowledged = Column(String(1), default='N')
+    acknowledged_by = Column(String(100))
+    acknowledged_date = Column(DateTime)
+
+class DrugAllergyMatrix(Base):
+    __tablename__ = "drug_allergy_matrix"
+    
+    interaction_id = Column(Integer, primary_key=True, index=True)
+    drug_code = Column(String(20))
+    drug_name = Column(String(100))
+    allergen_code = Column(String(20))
+    allergen_name = Column(String(100))
+    interaction_severity = Column(String(20))
+    interaction_description = Column(String(500))
+    created_date = Column(DateTime, default=datetime.utcnow)
+
 # Create all tables
 def init_db():
     Base.metadata.create_all(bind=engine)

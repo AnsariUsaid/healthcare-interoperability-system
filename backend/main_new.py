@@ -9,11 +9,12 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
+from sqlalchemy import or_, and_, func, case
 from datetime import datetime, timedelta
 from typing import List, Optional
-import cx_Oracle
 import os
 import uuid
+import json
 from dotenv import load_dotenv
 
 # Import our modules
@@ -21,7 +22,10 @@ import database
 import security
 import auth
 import models
-from database import User, Session as DBSession, AuditLog, BreakGlassAccess, PatientConsent, SecurityEvent
+from database import (
+    User, Session as DBSession, AuditLog, BreakGlassAccess, PatientConsent, SecurityEvent,
+    Patient, PatientRecord, HospitalSystem, MatchingScore, CriticalAlert, DrugAllergyMatrix
+)
 
 load_dotenv()
 
@@ -93,20 +97,6 @@ async def audit_logging_middleware(request: Request, call_next):
             pass
     
     return response
-
-# Oracle Database connection (for existing patient data)
-def get_oracle_connection():
-    try:
-        dsn_tns = cx_Oracle.makedsn('localhost', 1521, service_name='orcl')
-        connection = cx_Oracle.connect(
-            user=os.getenv('DB_USER', 'system'),
-            password=os.getenv('DB_PASSWORD', 'your_password_here'),
-            dsn=dsn_tns
-        )
-        return connection
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        return None
 
 # ==========================================
 # AUTHENTICATION ENDPOINTS
@@ -473,31 +463,30 @@ async def emergency_search(
         raise HTTPException(status_code=403, detail="Access denied: Cannot view PHI")
     
     try:
-        conn = get_oracle_connection()
-        if not conn:
-            raise HTTPException(status_code=500, detail="Database connection failed")
+        # Query patient with SQLAlchemy
+        query = db.query(
+            Patient,
+            func.count(PatientRecord.hospital_id.distinct()).label('num_hospitals')
+        ).outerjoin(
+            PatientRecord, Patient.patient_id == PatientRecord.patient_id
+        ).filter(
+            Patient.first_name.ilike(f"{first_name}%"),
+            Patient.last_name.ilike(f"{last_name}%")
+        ).group_by(
+            Patient.patient_id,
+            Patient.first_name,
+            Patient.last_name,
+            Patient.date_of_birth,
+            Patient.gender,
+            Patient.ssn,
+            Patient.phone,
+            Patient.email,
+            Patient.emergency_contact,
+            Patient.created_date,
+            Patient.last_updated
+        )
         
-        cursor = conn.cursor()
-        
-        query = """
-        SELECT 
-            p.Patient_ID,
-            p.First_Name,
-            p.Last_Name,
-            p.Date_of_Birth,
-            p.Gender,
-            p.Phone,
-            p.Emergency_Contact,
-            COUNT(DISTINCT pr.Hospital_ID) AS num_hospitals
-        FROM Patients p
-        LEFT JOIN Patient_Records pr ON p.Patient_ID = pr.Patient_ID
-        WHERE UPPER(p.First_Name) LIKE UPPER(:first_name || '%')
-          AND UPPER(p.Last_Name) LIKE UPPER(:last_name || '%')
-        GROUP BY p.Patient_ID, p.First_Name, p.Last_Name, p.Date_of_Birth, p.Gender, p.Phone, p.Emergency_Contact
-        """
-        
-        cursor.execute(query, {'first_name': first_name, 'last_name': last_name})
-        result = cursor.fetchone()
+        result = query.first()
         
         if not result:
             # Log failed search
@@ -515,89 +504,69 @@ async def emergency_search(
             
             raise HTTPException(status_code=404, detail="Patient not found")
         
-        patient_id = result[0]
+        patient_obj, num_hospitals = result
         patient = {
-            'patient_id': patient_id,
-            'first_name': result[1],
-            'last_name': result[2],
-            'date_of_birth': str(result[3]),
-            'gender': result[4],
-            'phone': result[5],
-            'emergency_contact': result[6],
-            'num_hospitals': result[7]
+            'patient_id': patient_obj.patient_id,
+            'first_name': patient_obj.first_name,
+            'last_name': patient_obj.last_name,
+            'date_of_birth': patient_obj.date_of_birth,
+            'gender': patient_obj.gender,
+            'phone': patient_obj.phone,
+            'emergency_contact': patient_obj.emergency_contact,
+            'num_hospitals': num_hospitals
         }
         
         # Apply data masking based on role
         patient = security.apply_data_masking(patient, current_user.role)
         
         # Get hospital records
-        hospital_query = """
-        SELECT 
-            hs.Hospital_Name,
-            pr.MRN,
-            pr.Last_Visit_Date,
-            pr.Current_Medications,
-            pr.Allergies,
-            pr.Chronic_Conditions
-        FROM Patient_Records pr
-        JOIN Hospital_Systems hs ON pr.Hospital_ID = hs.Hospital_ID
-        WHERE pr.Patient_ID = :patient_id
-        ORDER BY hs.Hospital_Name
-        """
+        records = db.query(PatientRecord, HospitalSystem).join(
+            HospitalSystem, PatientRecord.hospital_id == HospitalSystem.hospital_id
+        ).filter(
+            PatientRecord.patient_id == patient_obj.patient_id
+        ).order_by(HospitalSystem.hospital_name).all()
         
-        cursor.execute(hospital_query, {'patient_id': patient_id})
         hospital_records = []
-        for row in cursor.fetchall():
+        for record, hospital in records:
             hospital_records.append({
-                'hospital': row[0],
-                'mrn': row[1],
-                'last_visit': str(row[2]),
-                'medications': row[3],
-                'allergies': row[4],
-                'chronic_conditions': row[5]
+                'hospital': hospital.hospital_name,
+                'mrn': record.mrn,
+                'last_visit': record.last_visit_date,
+                'medications': record.current_medications,
+                'allergies': record.allergies,
+                'chronic_conditions': record.chronic_conditions
             })
         
         # Get critical alerts
-        alerts_query = """
-        SELECT 
-            Alert_ID,
-            Alert_Type,
-            Description,
-            Severity,
-            Alert_Details,
-            Acknowledged
-        FROM Critical_Alerts
-        WHERE Patient_ID = :patient_id
-        ORDER BY 
-            CASE Severity
-                WHEN 'CRITICAL' THEN 1
-                WHEN 'HIGH' THEN 2
-                WHEN 'MEDIUM' THEN 3
-            END
-        """
+        alerts_db = db.query(CriticalAlert).filter(
+            CriticalAlert.patient_id == patient_obj.patient_id
+        ).order_by(
+            case(
+                (CriticalAlert.severity == 'CRITICAL', 1),
+                (CriticalAlert.severity == 'HIGH', 2),
+                (CriticalAlert.severity == 'MEDIUM', 3),
+                else_=4
+            )
+        ).all()
         
-        cursor.execute(alerts_query, {'patient_id': patient_id})
         alerts = []
-        for row in cursor.fetchall():
+        for alert in alerts_db:
             alerts.append({
-                'alert_id': row[0],
-                'type': row[1],
-                'description': row[2],
-                'severity': row[3],
-                'details': row[4],
-                'acknowledged': row[5]
+                'alert_id': alert.alert_id,
+                'type': alert.alert_type,
+                'description': alert.description,
+                'severity': alert.severity,
+                'details': alert.alert_details,
+                'acknowledged': alert.acknowledged
             })
-        
-        cursor.close()
-        conn.close()
         
         # Log successful access
         audit_entry = AuditLog(
             user_id=current_user.user_id,
-            patient_id=patient_id,
+            patient_id=patient_obj.patient_id,
             action="VIEW",
             resource_type="PATIENT_FULL_RECORD",
-            resource_id=str(patient_id),
+            resource_id=str(patient_obj.patient_id),
             status="SUCCESS",
             ip_address=request.client.host,
             user_agent=request.headers.get("user-agent"),
@@ -617,6 +586,8 @@ async def emergency_search(
             }
         }
     
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -631,41 +602,22 @@ async def get_all_patients(
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        conn = get_oracle_connection()
-        if not conn:
-            raise HTTPException(status_code=500, detail="Database connection failed")
+        # Query all patients with SQLAlchemy
+        patients_db = db.query(Patient).order_by(Patient.last_name, Patient.first_name).all()
         
-        cursor = conn.cursor()
-        
-        query = """
-        SELECT 
-            Patient_ID,
-            First_Name,
-            Last_Name,
-            Date_of_Birth,
-            Gender,
-            Phone
-        FROM Patients
-        ORDER BY Last_Name, First_Name
-        """
-        
-        cursor.execute(query)
         patients = []
-        for row in cursor.fetchall():
+        for patient_obj in patients_db:
             patient = {
-                'patient_id': row[0],
-                'first_name': row[1],
-                'last_name': row[2],
-                'date_of_birth': str(row[3]),
-                'gender': row[4],
-                'phone': row[5]
+                'patient_id': patient_obj.patient_id,
+                'first_name': patient_obj.first_name,
+                'last_name': patient_obj.last_name,
+                'date_of_birth': patient_obj.date_of_birth,
+                'gender': patient_obj.gender,
+                'phone': patient_obj.phone
             }
             # Apply data masking
             patient = security.apply_data_masking(patient, current_user.role)
             patients.append(patient)
-        
-        cursor.close()
-        conn.close()
         
         return {'patients': patients, 'count': len(patients)}
     
@@ -913,55 +865,43 @@ async def get_system_stats(
 @app.get("/api/matching-scores", tags=["Legacy"])
 async def get_matching_scores(
     patient_id: int,
-    current_user: User = Depends(auth.get_current_active_user)
+    current_user: User = Depends(auth.get_current_active_user),
+    db: Session = Depends(database.get_db)
 ):
     """Get matching scores (requires authentication now)"""
     try:
-        conn = get_oracle_connection()
-        if not conn:
-            raise HTTPException(status_code=500, detail="Database connection failed")
+        # Query matching scores with SQLAlchemy
+        matches_db = db.query(
+            MatchingScore,
+            Patient.first_name.label('p1_first'),
+            Patient.last_name.label('p1_last'),
+            HospitalSystem.hospital_name.label('h1_name')
+        ).join(
+            Patient, MatchingScore.patient_id_1 == Patient.patient_id
+        ).join(
+            HospitalSystem, MatchingScore.hospital_id_1 == HospitalSystem.hospital_id
+        ).filter(
+            or_(MatchingScore.patient_id_1 == patient_id, MatchingScore.patient_id_2 == patient_id)
+        ).all()
         
-        cursor = conn.cursor()
-        
-        query = """
-        SELECT 
-            ms.Match_ID,
-            p1.First_Name || ' ' || p1.Last_Name AS Patient_1,
-            p2.First_Name || ' ' || p2.Last_Name AS Patient_2,
-            hs1.Hospital_Name AS Hospital_1,
-            hs2.Hospital_Name AS Hospital_2,
-            ms.Overall_Confidence_Score,
-            ms.First_Name_Score,
-            ms.Last_Name_Score,
-            ms.DOB_Score,
-            ms.SSN_Score
-        FROM Matching_Scores ms
-        JOIN Patients p1 ON ms.Patient_ID_1 = p1.Patient_ID
-        JOIN Patients p2 ON ms.Patient_ID_2 = p2.Patient_ID
-        JOIN Hospital_Systems hs1 ON ms.Hospital_ID_1 = hs1.Hospital_ID
-        JOIN Hospital_Systems hs2 ON ms.Hospital_ID_2 = hs2.Hospital_ID
-        WHERE ms.Patient_ID_1 = :patient_id OR ms.Patient_ID_2 = :patient_id
-        ORDER BY ms.Overall_Confidence_Score DESC
-        """
-        
-        cursor.execute(query, {'patient_id': patient_id})
         matches = []
-        for row in cursor.fetchall():
+        for match, p1_first, p1_last, h1_name in matches_db:
+            # Get second patient info
+            p2 = db.query(Patient).filter(Patient.patient_id == match.patient_id_2).first()
+            h2 = db.query(HospitalSystem).filter(HospitalSystem.hospital_id == match.hospital_id_2).first()
+            
             matches.append({
-                'match_id': row[0],
-                'patient_1': row[1],
-                'patient_2': row[2],
-                'hospital_1': row[3],
-                'hospital_2': row[4],
-                'confidence_score': float(row[5]),
-                'first_name_score': float(row[6]),
-                'last_name_score': float(row[7]),
-                'dob_score': float(row[8]),
-                'ssn_score': float(row[9])
+                'match_id': match.match_id,
+                'patient_1': f"{p1_first} {p1_last}",
+                'patient_2': f"{p2.first_name} {p2.last_name}" if p2 else "Unknown",
+                'hospital_1': h1_name,
+                'hospital_2': h2.hospital_name if h2 else "Unknown",
+                'confidence_score': float(match.overall_confidence_score) if match.overall_confidence_score else 0.0,
+                'first_name_score': float(match.first_name_score) if match.first_name_score else 0.0,
+                'last_name_score': float(match.last_name_score) if match.last_name_score else 0.0,
+                'dob_score': float(match.dob_score) if match.dob_score else 0.0,
+                'ssn_score': float(match.ssn_score) if match.ssn_score else 0.0
             })
-        
-        cursor.close()
-        conn.close()
         
         return {'matches': matches}
     
@@ -970,39 +910,24 @@ async def get_matching_scores(
 
 @app.get("/api/drug-interactions", tags=["Legacy"])
 async def get_drug_interactions(
-    current_user: User = Depends(auth.get_current_active_user)
+    current_user: User = Depends(auth.get_current_active_user),
+    db: Session = Depends(database.get_db)
 ):
     """Get drug interactions (requires authentication now)"""
     try:
-        conn = get_oracle_connection()
-        if not conn:
-            raise HTTPException(status_code=500, detail="Database connection failed")
+        # Query drug interactions with SQLAlchemy
+        interactions_db = db.query(DrugAllergyMatrix).filter(
+            DrugAllergyMatrix.interaction_severity.in_(['CONTRAINDICATED', 'SIGNIFICANT'])
+        ).order_by(DrugAllergyMatrix.interaction_severity.desc(), DrugAllergyMatrix.drug_name).all()
         
-        cursor = conn.cursor()
-        
-        query = """
-        SELECT 
-            Drug_Name,
-            Allergen_Name,
-            Interaction_Severity,
-            Interaction_Description
-        FROM Drug_Allergy_Matrix
-        WHERE Interaction_Severity IN ('CONTRAINDICATED', 'SIGNIFICANT')
-        ORDER BY Interaction_Severity DESC, Drug_Name
-        """
-        
-        cursor.execute(query)
         interactions = []
-        for row in cursor.fetchall():
+        for interaction in interactions_db:
             interactions.append({
-                'drug': row[0],
-                'allergen': row[1],
-                'severity': row[2],
-                'description': row[3]
+                'drug': interaction.drug_name,
+                'allergen': interaction.allergen_name,
+                'severity': interaction.interaction_severity,
+                'description': interaction.interaction_description
             })
-        
-        cursor.close()
-        conn.close()
         
         return {'interactions': interactions}
     
